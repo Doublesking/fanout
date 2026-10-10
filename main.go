@@ -97,6 +97,8 @@ func main() {
 	}
 
 	go mgr.WatchHealth()
+	// 节点列表周期刷新：VPN Gate 节点说没就没，靠启动时那一份会越来越不准
+	mgr.StartNodeRefresher()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

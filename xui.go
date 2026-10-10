@@ -30,6 +30,11 @@ type XUI struct {
 	client   *http.Client
 	// workDir 是 fanout 的工作目录，新建 TLS 入站时自签证书落在这里。
 	workDir string
+	// writeMu 串行化"读模板 → 改 → 写回"整个过程。
+	//
+	// 没有它时，两条隧道同时重连会各自读到同一份旧模板、各改各的、再各写回，
+	// 后写的把先写的覆盖掉——出站配置就这么丢了一条。配置写入必须只有一个写者。
+	writeMu sync.Mutex
 }
 
 // base 返回访问面板用的前缀。
@@ -504,48 +509,49 @@ func toStringSlice(v any) []string {
 	return nil
 }
 
-// Bind 把某个入站的流量导向指定隧道。slot 传 0 表示解绑，恢复直连。
-//
-// 只动 fanout- 前缀的出站与规则，用户手工配置的条目原样保留。
-func (x *XUI) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error {
-	var target *Tunnel
-	if hostname != "" {
-		for _, t := range tunnels {
-			if t.Node.HostName == hostname {
-				target = t
-				break
-			}
-		}
-		if target == nil {
-			return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
-		}
-		if target.Status != "up" {
-			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.Status)
-		}
-	}
+// canonicalJSON 把配置对象序列化成可比较的字节串。
+// json.Marshal 会对 map 的键排序，所以同一份配置永远得到同一串。
+func canonicalJSON(v any) (string, error) {
+	b, err := json.Marshal(v)
+	return string(b), err
+}
 
-	live := map[string]bool{}
-	for _, t := range tunnels {
-		if t.Status == "up" {
-			live[sanitizeTag(t.Node.HostName)] = true
-		}
-	}
-	current, err := x.Inbounds(live)
-	if err != nil {
-		return err
-	}
-	knownTags := map[string]bool{}
-	for _, ib := range current {
-		knownTags[ib.Tag] = true
-	}
+// mutateXray 读取面板当前的 Xray 配置模板，交给 fn 就地修改，
+// 只有真的改动了才写回并让面板重载 Xray。全程持 writeMu，同一时刻只有一个写者。
+//
+// "无改动就跳过"这一步不是优化，是必需的：saveXray 结尾是
+// panel/api/server/restartXrayService，一次全量重启会瞬断所有出口。
+// 而隧道原地重连（节点名没变）后的 resync、以及换节点时对每个入站各调一次的
+// Bind，绝大多数时候算出来的配置与面板里已有的完全一样——白重启一次，
+// 整池出口就跟着抖一次（实测 11 条隧道时平均每 1.6 分钟重启一次 Xray）。
+func (x *XUI) mutateXray(fn func(setting map[string]any, testURL string) error) error {
+	x.writeMu.Lock()
+	defer x.writeMu.Unlock()
 
 	setting, testURL, err := x.loadXray()
 	if err != nil {
 		return err
 	}
+	before, err := canonicalJSON(setting)
+	if err != nil {
+		return err
+	}
+	if err := fn(setting, testURL); err != nil {
+		return err
+	}
+	after, err := canonicalJSON(setting)
+	if err != nil {
+		return err
+	}
+	if before == after {
+		return nil
+	}
+	return x.saveXray(setting, testURL)
+}
 
-	x.syncOutbounds(setting, tunnels)
-
+// rebindRules 就地把 inboundTag 的 fanout 路由规则改成指向 target；
+// target 为 nil 表示解绑，恢复直连。只动 fanout- 前缀的规则，用户手工条目原样保留。
+func rebindRules(setting map[string]any, inboundTag string, target *Tunnel, knownTags map[string]bool) {
 	routing, _ := setting["routing"].(map[string]any)
 	if routing == nil {
 		routing = map[string]any{}
@@ -588,7 +594,48 @@ func (x *XUI) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error 
 
 	routing["rules"] = cleaned
 	setting["routing"] = routing
-	return x.saveXray(setting, testURL)
+}
+
+// Bind 把某个入站的流量导向指定隧道。hostname 传空表示解绑，恢复直连。
+//
+// 只动 fanout- 前缀的出站与规则，用户手工配置的条目原样保留。
+func (x *XUI) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error {
+	var target *Tunnel
+	if hostname != "" {
+		for _, t := range tunnels {
+			if t.Node.HostName == hostname {
+				target = t
+				break
+			}
+		}
+		if target == nil {
+			return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
+		}
+		if target.Status != "up" {
+			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.Status)
+		}
+	}
+
+	live := map[string]bool{}
+	for _, t := range tunnels {
+		if t.Status == "up" {
+			live[sanitizeTag(t.Node.HostName)] = true
+		}
+	}
+	current, err := x.Inbounds(live)
+	if err != nil {
+		return err
+	}
+	knownTags := map[string]bool{}
+	for _, ib := range current {
+		knownTags[ib.Tag] = true
+	}
+
+	return x.mutateXray(func(setting map[string]any, _ string) error {
+		x.syncOutbounds(setting, tunnels)
+		rebindRules(setting, inboundTag, target, knownTags)
+		return nil
+	})
 }
 
 // syncOutbounds 让 fanout- 出站与当前已连通的隧道保持一致。
@@ -1141,12 +1188,6 @@ func (x *XUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 		}
 	}
 
-	setting, testURL, err := x.loadXray()
-	if err != nil {
-		return err
-	}
-	x.syncOutbounds(setting, tunnels)
-
 	remain, err := x.Inbounds(nil)
 	if err != nil {
 		return err
@@ -1156,55 +1197,87 @@ func (x *XUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 		alive[ib.Tag] = true
 	}
 
-	routing, _ := setting["routing"].(map[string]any)
-	if routing == nil {
-		routing = map[string]any{}
-	}
-	rules, _ := routing["rules"].([]any)
-	cleaned := make([]any, 0, len(rules))
-	for _, r := range rules {
-		m, ok := r.(map[string]any)
-		if !ok {
-			cleaned = append(cleaned, r)
-			continue
+	return x.mutateXray(func(setting map[string]any, _ string) error {
+		x.syncOutbounds(setting, tunnels)
+
+		routing, _ := setting["routing"].(map[string]any)
+		if routing == nil {
+			routing = map[string]any{}
 		}
-		outTag, _ := m["outboundTag"].(string)
-		if !strings.HasPrefix(outTag, xuiTagPrefix) {
-			cleaned = append(cleaned, r)
-			continue
-		}
-		kept := []any{}
-		for _, it := range toStringSlice(m["inboundTag"]) {
-			if alive[it] {
-				kept = append(kept, it)
+		rules, _ := routing["rules"].([]any)
+		cleaned := make([]any, 0, len(rules))
+		for _, r := range rules {
+			m, ok := r.(map[string]any)
+			if !ok {
+				cleaned = append(cleaned, r)
+				continue
+			}
+			outTag, _ := m["outboundTag"].(string)
+			if !strings.HasPrefix(outTag, xuiTagPrefix) {
+				cleaned = append(cleaned, r)
+				continue
+			}
+			kept := []any{}
+			for _, it := range toStringSlice(m["inboundTag"]) {
+				if alive[it] {
+					kept = append(kept, it)
+				}
+			}
+			if len(kept) > 0 {
+				m["inboundTag"] = kept
+				cleaned = append(cleaned, m)
 			}
 		}
-		if len(kept) > 0 {
-			m["inboundTag"] = kept
-			cleaned = append(cleaned, m)
-		}
-	}
-	routing["rules"] = cleaned
-	setting["routing"] = routing
-	return x.saveXray(setting, testURL)
+		routing["rules"] = cleaned
+		setting["routing"] = routing
+		return nil
+	})
 }
 
 // Rebind 把原本绑到 oldHost 的入站改绑到新节点上。
 // 隧道换节点后出站 tag 会变，需要同步路由规则。
+//
+// 命中多个入站时在**一次** mutateXray 里全部改完：原来是对每个入站各调一次
+// Bind，而每次 Bind 都以一次全量 Xray 重启收尾，换一个节点能把面板重启好几轮。
 func (x *XUI) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) error {
 	list, err := x.Inbounds(nil)
 	if err != nil {
 		return err
 	}
 	oldTag := sanitizeTag(oldHost)
-	newLabel := exitLabel(target)
+
+	knownTags := map[string]bool{}
+	var hits []Inbound
 	for _, ib := range list {
-		if ib.BoundTo != oldTag {
-			continue
+		knownTags[ib.Tag] = true
+		if ib.BoundTo == oldTag {
+			hits = append(hits, ib)
 		}
-		if err := x.Bind(ib.Tag, target.Node.HostName, tunnels); err != nil {
-			return err
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+	// 没有入站需要改绑时不必校验目标，保持与原来"每个入站各调一次 Bind"一致
+	if target == nil {
+		return fmt.Errorf("目标隧道不存在，无法改绑")
+	}
+	if target.Status != "up" {
+		return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", target.Node.HostName, target.Status)
+	}
+
+	if err := x.mutateXray(func(setting map[string]any, _ string) error {
+		x.syncOutbounds(setting, tunnels)
+		for _, ib := range hits {
+			rebindRules(setting, ib.Tag, target, knownTags)
 		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// 备注改名走面板的入站接口，与 Xray 运行配置无关，不会触发重启
+	newLabel := exitLabel(target)
+	for _, ib := range hits {
 		// 备注里带着旧出口的地区和 IP 尾段，换了节点要跟着改，否则名不副实
 		if renamed := renameExitLabel(ib.Remark, newLabel); renamed != ib.Remark {
 			if err := x.renameInbound(ib.ID, renamed); err != nil {
@@ -1513,13 +1586,14 @@ func (x *XUI) Close() {}
 
 // ResyncOutbound 重写某条隧道对应的出站配置。
 // 用于隧道原地重连（节点名没变）后刷新端口等信息。
+//
+// 走 mutateXray：算出来的配置与面板里已有的完全一样时直接返回，不写回、
+// 不重启 Xray。隧道原地重连是最高频的触发点，这一步省掉的是整池出口的瞬断。
 func (x *XUI) ResyncOutbound(t *Tunnel, tunnels []*Tunnel) error {
-	setting, testURL, err := x.loadXray()
-	if err != nil {
-		return err
-	}
-	x.syncOutbounds(setting, tunnels)
-	return x.saveXray(setting, testURL)
+	return x.mutateXray(func(setting map[string]any, _ string) error {
+		x.syncOutbounds(setting, tunnels)
+		return nil
+	})
 }
 
 // forceIPv4 让直连类出站只走 IPv4。

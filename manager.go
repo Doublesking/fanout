@@ -18,27 +18,113 @@ type Manager struct {
 	workDir  string
 	maxSlots int
 	jobs     JobStore
+	// applier 是后端配置写入的唯一入口（见 applier.go）。
+	applier *configApplier
+	// refreshMu 串行化节点列表的拉取。
+	//
+	// 重连循环每条隧道每轮都要刷一次列表，11 条隧道同时失败就是对上游的
+	// 11 个并发请求，很容易被限流甚至封 IP。拿这把锁的只有真正要发请求的人，
+	// 其余调用者等它拉完直接复用结果。
+	refreshMu sync.Mutex
+	// fetchNodes 是拉取节点列表的实现。留成字段是为了单测能替换掉，
+	// 免得跑个测试真的去打 VPN Gate。
+	fetchNodes func(time.Duration) ([]Node, error)
 }
 
 func NewManager(maxSlots int, workDir string) *Manager {
-	return &Manager{
+	m := &Manager{
 		tunnels:  map[int]*Tunnel{},
 		workDir:  workDir,
 		maxSlots: maxSlots,
 	}
+	m.applier = newConfigApplier(m)
+	m.fetchNodes = fetchNodes
+	return m
 }
 
+// 节点列表的刷新节奏。
+const (
+	// nodeRefreshEvery 是后台周期刷新的间隔。
+	//
+	// VPN Gate 节点寿命很短（志愿者机器说关就关），列表只在启动/手动/重连时更新的话，
+	// 界面上的地区可用数会越来越不准，挑节点也容易挑到已经死掉的。
+	nodeRefreshEvery = 12 * time.Minute
+	// nodeCacheTTL 是列表的最短复用时间：没过期就直接复用，不再发请求。
+	nodeCacheTTL = 90 * time.Second
+)
+
 // RefreshNodes 重新拉取节点列表。
+//
+// 多个并发调用只会真的拉一次：后到的等前一个拉完，直接复用刚拿到的结果。
 func (m *Manager) RefreshNodes() (int, error) {
-	nodes, err := fetchNodes(60 * time.Second)
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	return m.refreshNodesLocked()
+}
+
+// refreshNodesIfStale 只在列表过期时才真的拉一次。
+//
+// 重连循环里用它替代 RefreshNodes：一条隧道一轮重试拉一次列表，
+// 11 条隧道同时失败就是 11 个并发请求打到上游。VPN Gate 的列表十几分钟才更新一次，
+// 缓存没过期就复用完全够用，也免得把出口池刷成别人眼里的攻击源。
+func (m *Manager) refreshNodesIfStale() (int, error) {
+	if m.nodesFresh() {
+		return len(m.NodesOnly()), nil
+	}
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	// 等锁期间可能有人刚拉过，再确认一次
+	if m.nodesFresh() {
+		return len(m.NodesOnly()), nil
+	}
+	return m.refreshNodesLocked()
+}
+
+// nodesFresh 判断缓存的节点列表还能不能用。
+func (m *Manager) nodesFresh() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.nodes) > 0 && time.Since(m.fetched) < nodeCacheTTL
+}
+
+// NodesOnly 只取节点列表，不关心拉取时间。
+func (m *Manager) NodesOnly() []Node {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Node, len(m.nodes))
+	copy(out, m.nodes)
+	return out
+}
+
+// refreshNodesLocked 真的发一次请求。调用方必须已持 refreshMu。
+func (m *Manager) refreshNodesLocked() (int, error) {
+	nodes, err := m.fetchNodes(60 * time.Second)
 	if err != nil {
 		return 0, err
+	}
+	// 上游抽风返回空列表时保留原列表：把手里能用的节点全丢掉，
+	// 等于让所有出口一起失去候选，比用一份略旧的列表糟得多。
+	if len(nodes) == 0 {
+		return 0, fmt.Errorf("上游返回 0 个节点，保留原列表")
 	}
 	m.mu.Lock()
 	m.nodes = nodes
 	m.fetched = time.Now()
 	m.mu.Unlock()
 	return len(nodes), nil
+}
+
+// StartNodeRefresher 起一个后台协程周期刷新节点列表。
+func (m *Manager) StartNodeRefresher() {
+	go func() {
+		for range time.Tick(nodeRefreshEvery) {
+			if n, err := m.RefreshNodes(); err != nil {
+				log.Printf("周期刷新节点列表失败: %v", err)
+			} else {
+				log.Printf("周期刷新节点列表完成，共 %d 个节点", n)
+			}
+		}
+	}()
 }
 
 func (m *Manager) Nodes() ([]Node, time.Time) {
@@ -122,7 +208,26 @@ func (m *Manager) bringUp(t *Tunnel, notify bool) {
 const (
 	reconnectBackoffMin = 5 * time.Second
 	reconnectBackoffMax = 60 * time.Second
+	// backoffSlowFactor 是"这条出口最近掉得比较勤"时起步退避放大的倍数。
+	backoffSlowFactor = 4
 )
+
+// initialBackoff 按这条出口最近的掉线频率决定从多长的退避起步。
+//
+// 退避原来是 bringUpPersist 的局部变量，每次重连都从 5 秒重新起步。
+// 于是一个"连上几十秒又掉"的节点会永远以 5 秒空转：退避永远升不上去，
+// 重连循环就成了常态，出口看着一直在动，实际上没一会儿是通的。
+// 掉得越勤，起步退避越长，到熔断线直接拉到上限。
+func (m *Manager) initialBackoff(t *Tunnel) time.Duration {
+	switch n := t.flapRate(time.Now()); {
+	case n >= flapCircuitBreaker:
+		return reconnectBackoffMax
+	case n >= flapSwapAfter:
+		return reconnectBackoffMin * backoffSlowFactor
+	default:
+		return reconnectBackoffMin
+	}
+}
 
 // bringUpPersist 把一条隧道拉起来。
 //
@@ -131,7 +236,7 @@ const (
 // 一直循环到连上或这条隧道被用户停掉。VPN Gate 死节点多，"当前都不可用"往往只是
 // 这一批候选恰好都挂了，过一会儿就有新节点，不该让出口永久躺死。
 func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
-	backoff := reconnectBackoffMin
+	backoff := m.initialBackoff(t)
 	for {
 		if m.tryCandidates(t, notify) {
 			return
@@ -155,7 +260,7 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 		if !m.tunnelActive(t) {
 			return
 		}
-		if _, err := m.RefreshNodes(); err != nil {
+		if _, err := m.refreshNodesIfStale(); err != nil {
 			log.Printf("重试前刷新节点列表失败: %v", err)
 		}
 		if backoff < reconnectBackoffMax {
@@ -172,6 +277,8 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 	// VPN Gate 是志愿者节点，列表里有相当比例已下线或满员（AUTH_FAILED），
 	// 连不上就顺着候选列表换下一个，不必让用户手动试。
 	candidates := m.candidatesFor(t)
+	// 记下这次出发时想去的地区：候选里混进跨地区备胎时，日志里能看出来
+	want := t.Node.CountryCode
 	for i, node := range candidates {
 		if !m.tunnelActive(t) {
 			return false
@@ -190,6 +297,10 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 		if err == nil {
 			t.Status = "up"
 			t.Err = ""
+			if want != "" && node.CountryCode != "" && node.CountryCode != want {
+				log.Printf("隧道 %d 原地区 %s 没有可用节点，已换到 %s (%s)",
+					t.Slot, want, node.CountryCode, node.HostName)
+			}
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
 			}
@@ -239,13 +350,19 @@ func (m *Manager) tryNode(t *Tunnel) error {
 
 // candidatesFor 以这条隧道当前的节点打头，后面跟上同地区的其他节点作为备选。
 //
-// 打头的一定是 t.Node：自动重连的目标是把这条出口恢复原样，先试原节点。
+// 打头的一般是 t.Node：自动重连的目标是把这条出口恢复原样，先试原节点。
 // 备选会避开用户手动换掉过的节点——那些是他明确不想要的 IP，
 // 让重连悄悄换回去等于撤销了他的操作。
+//
+// 例外是抖动黑名单里的节点（见 Tunnel.flapped）：它们连得上、但留不住，
+// 再把它排在第一位只会让重连一轮轮空转，每轮都白重启一次面板的 Xray。
 func (m *Manager) candidatesFor(t *Tunnel) []Node {
 	const maxTries = 6
+	// minRegionCandidates 是同地区候选少到这个数以下时，放宽到任意地区兜底。
+	const minRegionCandidates = 2
 	first := t.Node
 	avoid := t.swapAvoid()
+	skipFirst := t.isFlapped(first.HostName)
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -267,8 +384,12 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 		}
 	}
 
-	out := []Node{first}
-	for _, n := range m.nodePoolLocked() {
+	pool := m.nodePoolLocked()
+	out := []Node{}
+	if !skipFirst {
+		out = append(out, first)
+	}
+	for _, n := range pool {
 		if len(out) >= maxTries {
 			break
 		}
@@ -280,6 +401,34 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 			continue
 		}
 		out = append(out, n)
+	}
+
+	// 同地区候选太少就放宽到任意地区兜底。
+	//
+	// VPN Gate 有些地区就那么一两个节点，还经常整段挂掉——US 和 UA 两条出口
+	// 就是死在这：同地区再没有能试的节点，于是一轮轮"候选均失败"，出口一直躺着。
+	// 首选仍然是原地区（上面已经排在前面），跨地区的只是失败之后的备胎：
+	// 换个国家的出口，总比这条出口彻底不通强。
+	if len(out) < minRegionCandidates {
+		have := map[string]bool{}
+		for _, n := range out {
+			have[n.HostName] = true
+		}
+		for _, n := range pool {
+			if len(out) >= maxTries {
+				break
+			}
+			if used[n.HostName] || avoid[n.HostName] || have[n.HostName] {
+				continue
+			}
+			out = append(out, n)
+		}
+	}
+
+	if len(out) == 0 {
+		// 连跨地区备胎都没有：宁可回原节点再试一次，
+		// 也不能让这条隧道连一个候选都没有
+		out = append(out, first)
 	}
 	return out
 }
@@ -446,6 +595,7 @@ func (m *Manager) syncCred(t *Tunnel) {
 
 // Shutdown 停掉运行态但保留状态文件，让下次启动能恢复同样的隧道。
 func (m *Manager) Shutdown() {
+	m.applier.close()
 	for _, t := range m.Tunnels() {
 		t.stop()
 	}
@@ -495,13 +645,9 @@ func (m *Manager) resync(t *Tunnel) error {
 //
 // 自建模式下出站是由隧道列表现算出来的，不通知的话新开的出口在 Xray 里
 // 没有对应的 socks 出站，绑定会指向一个不存在的 tag。接管 3x-ui 时是空操作。
-// 后端不可用不该让开关出口失败，所以只记日志。
+//
+// 通知走去抖合并（见 applier.go）：启动恢复、批量建出口时多条隧道几乎同时 up，
+// 逐条通知就是逐条重建配置 + 逐条重启 Xray。后端不可用不该让开关出口失败。
 func (m *Manager) notifyPanel() {
-	p, err := openPanel()
-	if err != nil {
-		return
-	}
-	if err := p.OnTunnelsChanged(m.Tunnels()); err != nil {
-		log.Printf("同步节点链接后端失败: %v", err)
-	}
+	m.applier.markDirty()
 }

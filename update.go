@@ -198,6 +198,17 @@ func applyUpdate() error {
 	if err := copyFileMode(newBin, staged, 0755); err != nil {
 		return fmt.Errorf("写入新版本失败: %w", err)
 	}
+
+	// 替换前把当前这个（已知跑得起来的）二进制留一份。
+	//
+	// 新版本起不来时机器上就再没有能用的 fanout 了：面板、出口全没，只能重新装。
+	// 留一份 .bak，回滚就是一条 cp。注意备份的是"正在跑的"这一份，不是上一份备份，
+	// 否则连续更新两次就会把 .bak 也换成一个坏的。
+	if err := copyFileMode(self, self+".bak", 0755); err != nil {
+		os.Remove(staged)
+		return fmt.Errorf("备份当前版本失败（已放弃更新）: %w", err)
+	}
+
 	if err := os.Rename(staged, self); err != nil {
 		os.Remove(staged)
 		return fmt.Errorf("替换二进制失败: %w", err)
@@ -340,7 +351,9 @@ func copyFileMode(src, dst string, mode os.FileMode) error {
 // systemd / openrc 各一套；都不可用时退回直接自我 exec。
 func restartSelf() {
 	if hasCmd("systemctl") && dirExists("/run/systemd/system") {
-		_ = exec.Command("systemctl", "restart", "fanout").Start()
+		// 用 try-restart 而不是 restart：服务本来就是被用户停掉的话，
+		// 不该因为一次自更新又把它拉起来。用户停服务是个明确的意思表示。
+		_ = exec.Command("systemctl", "try-restart", "fanout").Start()
 		return
 	}
 	if hasCmd("rc-service") {

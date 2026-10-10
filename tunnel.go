@@ -46,6 +46,22 @@ type Tunnel struct {
 	// 两边对不上，那个入站就掉成了没人认领的孤儿。
 	// 这个字段跟着状态一起落盘，重启后照着它把入站接回来。
 	prevHost string
+	// flapped 是"连得上但留不住"的节点黑名单：健康检查连续判定掉线的记在这里。
+	//
+	// 只靠 swapped（用户明确不要的）不够。自动重连的候选列表按设计把当前节点
+	// 排在第一位（目标是恢复原样），于是一个连得上、几十秒后又掉的节点会被
+	// 无限重连——每轮都触发一次全量 Xray 重启，把整池出口拖下水。
+	// 记进这里之后，重连才会真的绕开它。
+	flapped map[string]bool
+	// flapTimes 是最近 flapWindow 内的掉线时刻，用来判断这条出口是不是"怎么都稳不住"。
+	//
+	// 退避原来每次重连都从 5 秒重新起步（backoff 是 bringUpPersist 的局部变量），
+	// 于是一个连上几十秒又掉的节点永远以 5 秒空转，退避永远升不上去。
+	// 把频率记在这里，起步退避才能随掉线次数往上走。
+	flapTimes []time.Time
+	// breakerNotified 记"这条出口已经触发过熔断告警"，避免同一件事反复刷日志。
+	// 掉线频率降下来之后清掉，下次再犯还能报。
+	breakerNotified bool
 }
 
 // prevHostOf 读"换节点未收尾"标记。
@@ -107,6 +123,109 @@ func (t *Tunnel) forgetSwaps() {
 	t.mu.Lock()
 	t.swapped = nil
 	t.mu.Unlock()
+}
+
+// flapHistoryMax 是抖动黑名单的上限。
+// 同地区可用节点通常就个位数，留太多会把候选排干、反而让重连无节点可选。
+const flapHistoryMax = 8
+
+// markFlap 把一个"连得上但留不住"的节点记进黑名单，返回是否是首次记入。
+//
+// 首次才返回 true，调用方据此只打一条日志，不刷屏。
+func (t *Tunnel) markFlap(host string) bool {
+	if host == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.flapped == nil {
+		t.flapped = map[string]bool{}
+	}
+	if t.flapped[host] {
+		return false
+	}
+	t.flapped[host] = true
+	if len(t.flapped) > flapHistoryMax {
+		// map 没有先后顺序，超出上限时只保留刚记的这个：
+		// 黑名单是临时判断，压着太多旧账反而会让候选枯竭
+		t.flapped = map[string]bool{host: true}
+	}
+	return true
+}
+
+// isFlapped 判断节点是否在抖动黑名单里。
+func (t *Tunnel) isFlapped(host string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.flapped[host]
+}
+
+// clearFlap 解除某个节点的抖动标记，返回是否真的清掉了。
+// 隧道稳定跑够久之后调用，让节点重新有资格被选中。
+func (t *Tunnel) clearFlap(host string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.flapped[host] {
+		return false
+	}
+	delete(t.flapped, host)
+	return true
+}
+
+// flapWindow 是统计掉线频率的时间窗。
+//
+// 取 10 分钟：VPN Gate 节点寿命本来就短，窗口太短会把"偶尔掉一次"误判成
+// 惯犯；太长又会让一条已经坏掉的出口拖很久才被加退避。
+const flapWindow = 10 * time.Minute
+
+// noteFlap 记一次掉线，返回窗口内的掉线次数。
+func (t *Tunnel) noteFlap(now time.Time) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.flapTimes = append(t.flapTimes, now)
+	cut := now.Add(-flapWindow)
+	keep := t.flapTimes[:0]
+	for _, ts := range t.flapTimes {
+		if ts.After(cut) {
+			keep = append(keep, ts)
+		}
+	}
+	t.flapTimes = keep
+	return len(t.flapTimes)
+}
+
+// flapRate 返回窗口内的掉线次数。
+func (t *Tunnel) flapRate(now time.Time) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	cut := now.Add(-flapWindow)
+	n := 0
+	for _, ts := range t.flapTimes {
+		if ts.After(cut) {
+			n++
+		}
+	}
+	return n
+}
+
+// clearFlaps 清空掉线记录并允许再次告警。
+// 隧道稳定运行够久之后调用，让它从"惯犯"回到正常起点。
+func (t *Tunnel) clearFlaps() {
+	t.mu.Lock()
+	t.flapTimes = nil
+	t.breakerNotified = false
+	t.mu.Unlock()
+}
+
+// markBreakerNotified 只在第一次触发熔断时返回 true，避免同一件事反复刷日志。
+func (t *Tunnel) markBreakerNotified() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.breakerNotified {
+		return false
+	}
+	t.breakerNotified = true
+	return true
 }
 
 // 名字里都带上实例标识，否则同机第二个 fanout 会把这条隧道拆掉（见 instance.go）。

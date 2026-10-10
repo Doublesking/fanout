@@ -12,12 +12,23 @@ const (
 	healthInterval = 10 * time.Second
 	healthFailures = 2 // 连续失败几次才判定掉线，避免网络抖动误杀
 	healthTimeout  = 6 * time.Second
+	// flapSwapAfter 次掉线后，把当前节点记进抖动黑名单，重连不再优先选它。
+	//
+	// 这类节点连得上、几十秒后又掉。候选列表按设计把当前节点排第一位，
+	// 于是重连就是一轮轮空转——每轮都白重启一次面板的 Xray，整池出口跟着瞬断。
+	flapSwapAfter = 3
+	// flapForgetRounds 是"稳定多少轮之后重新信任这个节点"，10 秒一轮，18 轮约 3 分钟。
+	flapForgetRounds = 18
+	// flapCircuitBreaker 是 flapWindow 内的掉线次数上限。到这个数就把退避拉到最长，
+	// 别让一条怎么都稳不住的出口把重连循环打成常态。
+	flapCircuitBreaker = 6
 )
 
 // WatchHealth 周期检查每条隧道是否还能出网，掉线的自动换节点重连。
 // VPN Gate 是志愿者节点，运行中掉线很常见。
 func (m *Manager) WatchHealth() {
 	fails := map[int]int{}
+	stable := map[int]int{}
 
 	for range time.Tick(healthInterval) {
 		for _, t := range m.Tunnels() {
@@ -26,8 +37,19 @@ func (m *Manager) WatchHealth() {
 			}
 			if m.tunnelHealthy(t) {
 				fails[t.Slot] = 0
+				stable[t.Slot]++
+				if stable[t.Slot] >= flapForgetRounds {
+					// 稳定够久了：节点重新有资格被选中，掉线记录也清零，
+					// 否则一次网络抽风会把它永久钉成"惯犯"。
+					if t.clearFlap(t.Node.HostName) {
+						log.Printf("隧道 %d (%s) 已稳定运行，解除抖动标记", t.Slot, t.Node.HostName)
+					}
+					t.clearFlaps()
+					stable[t.Slot] = 0
+				}
 				continue
 			}
+			stable[t.Slot] = 0
 
 			fails[t.Slot]++
 			if fails[t.Slot] < healthFailures {
@@ -35,9 +57,19 @@ func (m *Manager) WatchHealth() {
 				continue
 			}
 
-			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, t.Node.HostName)
+			host := t.Node.HostName
+			n := t.noteFlap(time.Now())
+			if n >= flapSwapAfter && t.markFlap(host) {
+				log.Printf("隧道 %d (%s) 近 %.0f 分钟第 %d 次掉线，重连时不再优先选它",
+					t.Slot, host, flapWindow.Minutes(), n)
+			}
+			if n >= flapCircuitBreaker && t.markBreakerNotified() {
+				log.Printf("隧道 %d (%s) 近 %.0f 分钟已掉线 %d 次，退避拉长到 %.0f 秒",
+					t.Slot, host, flapWindow.Minutes(), n, reconnectBackoffMax.Seconds())
+			}
+			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, host)
 			fails[t.Slot] = 0
-			m.reconnect(t, t.Node.HostName)
+			m.reconnect(t, host)
 		}
 	}
 }
